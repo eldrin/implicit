@@ -304,6 +304,178 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         return self._YtY
 
 
+class ALS4Graph(AlternatingLeastSquares):
+
+    """ Alternating Least Squares for Graph data
+
+    This is a simple overriden class of ALS to specifically consider
+    the special case where the graph data is given, thus we can (probably)
+    use only the single set of factors rather than user/item factors
+
+    Parameters
+    ----------
+    factors : int, optional
+        The number of latent factors to compute
+    regularization : float, optional
+        The regularization factor to use
+    dtype : data-type, optional
+        Specifies whether to generate 64 bit or 32 bit floating point factors
+    use_native : bool, optional
+        Use native extensions to speed up model fitting
+    use_cg : bool, optional
+        Use a faster Conjugate Gradient solver to calculate factors
+    use_gpu : bool, optional
+        Fit on the GPU if available, default is to run on GPU only if available
+    iterations : int, optional
+        The number of ALS iterations to use when fitting data
+    calculate_training_loss : bool, optional
+        Whether to log out the training loss at each iteration
+    num_threads : int, optional
+        The number of threads to use for fitting the model. This only
+        applies for the native extensions. Specifying 0 means to default
+        to the number of cores on the machine.
+    random_state : int, RandomState or None, optional
+        The random state for seeding the initial item and user factors.
+        Default is None.
+
+    Attributes
+    ----------
+    factors : ndarray
+            Array of latent factors for each node in the training set
+    """
+    def fit(self, node_node, show_progress=True):
+        """ Factorizes the node_node matrix.
+
+        After calling this method, the member 'node_factors' will be
+        initialized with a latent factor model of the input data.
+
+        The node_node matrix does double duty here. It defines which node are linked with which
+        node (P_iu in the original paper), as well as how much confidence we have that the user
+        liked the item (C_iu).
+
+        The negative items are implicitly defined: This code assumes that positive items in the
+        item_users matrix means that the user liked the item. The negatives are left unset in this
+        sparse matrix: the library will assume that means Piu = 0 and Ciu = 1 for all these items.
+        Negative items can also be passed with a higher confidence value by passing a negative
+        value, indicating that the user disliked the item.
+
+        Parameters
+        ----------
+        node_node: csr_matrix
+            Matrix of confidences for the node connectivity. If the graph is directed,
+            This matrix should be a csr_matrix where the rows of the matrix are the destination node,
+            the columns are the starting node that linked to the node,
+            and the value is the confidence that the node linked to the destination node.
+        show_progress : bool, optional
+            Whether to show a progress bar during fitting
+        """
+        # initialize the random state
+        random_state = check_random_state(self.random_state)
+
+        # for now, we use the same variable name scheme
+        Ciu = node_node
+        if not isinstance(Ciu, scipy.sparse.csr_matrix):
+            s = time.time()
+            log.debug("Converting input to CSR format")
+            Ciu = Ciu.tocsr()
+            log.debug("Converted input to CSR in %.3fs", time.time() - s)
+
+        if Ciu.dtype != np.float32:
+            Ciu = Ciu.astype(np.float32)
+
+        s = time.time()
+        Cui = Ciu.T.tocsr()
+        log.debug("Calculated transpose in %.3fs", time.time() - s)
+
+        items, users = Ciu.shape
+
+        s = time.time()
+        # Initialize the variables randomly if they haven't already been set
+        # TODO: currently (since still using the matrixfactorizationbase as the base)
+        #       using the variable names inherited from MFbase. will be replaced once
+        #       graphfactorizationbase done
+        if self.user_factors is None:
+            # self.user_factors = random_state.rand(users, self.factors).astype(self.dtype) * 0.01
+            self.user_factors = random_state.randn(users, self.factors).astype(self.dtype) * 0.01
+
+        log.debug("Initialized factors in %s", time.time() - s)
+
+        # invalidate cached norms and squared factors
+        self._item_norms = None
+        self._YtY = None
+
+        if self.use_gpu:
+            return self._fit_gpu(Ciu, Cui, show_progress)
+
+        solver = self.solver
+        log.debug("Running %i ALS iterations", self.iterations)
+        with tqdm(total=self.iterations, disable=not show_progress) as progress:
+            # alternate between learning the user_factors from the item_factors and vice-versa
+            for iteration in range(self.iterations):
+                s = time.time()
+                tmp = self.user_factors.copy()
+                solver(Cui, self.user_factors, tmp, self.regularization,
+                       num_threads=self.num_threads)
+                tmp = self.user_factors.copy()
+                solver(Ciu, self.user_factors, tmp, self.regularization,
+                       num_threads=self.num_threads)
+                progress.update(1)
+
+                if self.calculate_training_loss:
+                    loss = _als.calculate_loss(Cui, self.user_factors, self.user_factors,
+                                               self.regularization, num_threads=self.num_threads)
+                    progress.set_postfix({"loss": loss})
+
+                if self.fit_callback:
+                    self.fit_callback(iteration, time.time() - s)
+
+        if self.calculate_training_loss:
+            log.info("Final training loss %.4f", loss)
+
+    def _fit_gpu(self, Ciu_host, Cui_host, show_progress=True):
+        """ specialized training on the gpu. copies inputs to/from cuda device """
+        if not implicit.cuda.HAS_CUDA:
+            raise ValueError("No CUDA extension has been built, can't train on GPU.")
+
+        if self.dtype == np.float64:
+            log.warning("Factors of dtype float64 aren't supported with gpu fitting. "
+                        "Converting factors to float32")
+            self.item_factors = self.item_factors.astype(np.float32)
+            # self.user_factors = self.user_factors.astype(np.float32)
+
+        Ciu = implicit.cuda.CuCSRMatrix(Ciu_host)
+        Cui = implicit.cuda.CuCSRMatrix(Cui_host)
+        X = implicit.cuda.CuDenseMatrix(self.user_factors.astype(np.float32))
+        def _cpy_cudamat(cudamat, npymat):
+            cudamat.to_host(npymat)
+            tmp = npymat.copy()
+            return implicit.cuda.CuDenseMatrix(tmp)
+
+        solver = implicit.cuda.CuLeastSquaresSolver(self.factors)
+        log.debug("Running %i ALS iterations", self.iterations)
+        with tqdm(total=self.iterations, disable=not show_progress) as progress:
+            for iteration in range(self.iterations):
+                s = time.time()
+                tmp = _cpy_cudamat(X, self.user_factors)
+                solver.least_squares(Cui, X, tmp, self.regularization, self.cg_steps)
+                tmp = _cpy_cudamat(X, self.user_factors)
+                solver.least_squares(Ciu, X, tmp, self.regularization, self.cg_steps)
+                progress.update(1)
+
+                if self.fit_callback:
+                    self.fit_callback(iteration, time.time() - s)
+
+                if self.calculate_training_loss:
+                    loss = solver.calculate_loss(Cui, X, X, self.regularization)
+                    progress.set_postfix({"loss": loss})
+
+        if self.calculate_training_loss:
+            log.info("Final training loss %.4f", loss)
+
+        X.to_host(self.user_factors)
+        # Y.to_host(self.item_factors)
+
+
 def alternating_least_squares(Ciu, factors, **kwargs):
     """ factorizes the matrix Cui using an implicit alternating least squares
     algorithm. Note: this method is deprecated, consider moving to the

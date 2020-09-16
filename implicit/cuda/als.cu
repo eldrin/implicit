@@ -29,7 +29,9 @@ __global__ void least_squares_cg_kernel(int factors, int user_count, int item_co
 
         // handle 0-sized rows
         if (indptr[u] == indptr[u+1]) {
-            x[threadIdx.x] = 0;
+            // TODO: this line is commented out as a heuristic for graph data
+            //       and should be dealt with sophisticated way later
+            // x[threadIdx.x] = 0;
             continue;
         }
 

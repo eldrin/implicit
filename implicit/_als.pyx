@@ -81,7 +81,8 @@ def _least_squares(integral[:] indptr, integral[:] indices, float[:] data,
             for u in prange(users, schedule='guided'):
                 # if we have no items for this user, skip and set to zero
                 if indptr[u] == indptr[u+1]:
-                    memset(&X[u, 0], 0, sizeof(floating) * factors)
+                    # TODO: this line is commented out as heuristics for Graph data
+                    # memset(&X[u, 0], 0, sizeof(floating) * factors)
                     continue
 
                 # For each user u calculate
@@ -163,7 +164,8 @@ def _least_squares_cg(integral[:] indptr, integral[:] indices, float[:] data,
 
                 # if we have no items for this user, skip and set to zero
                 if indptr[u] == indptr[u+1]:
-                    memset(x, 0, sizeof(floating) * N)
+                    # TODO: this line is commented out as heuristics for Graph data
+                    # memset(x, 0, sizeof(floating) * N)
                     continue
 
                 # calculate residual r = (YtCuPu - (YtCuY.dot(Xu)
